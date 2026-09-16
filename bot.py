@@ -25,6 +25,7 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -406,13 +407,29 @@ async def clear_draft_keyboard(bot, chat_id: int, draft: dict) -> None:
         pass
 
 
+async def safe_answer(query) -> None:
+    """Ответить на нажатие кнопки, не падая, если callback уже устарел.
+
+    Телеграм отклоняет ответ на callback, если бот был выключен и не успел
+    его обработать вовремя ("Query is too old..."). Это ожидаемая ситуация,
+    а не баг — просто молча пропускаем её, любые другие ошибки пробрасываем.
+    """
+    try:
+        await query.answer()
+    except BadRequest as exc:
+        if "query is too old" in str(exc).lower() or "query id is invalid" in str(exc).lower():
+            logger.info("Пропущен устаревший callback: %s", exc)
+        else:
+            raise
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query.from_user.id != ADMIN_USER_ID:
-        await query.answer()
+        await safe_answer(query)
         return
 
-    await query.answer()
+    await safe_answer(query)
     draft = context.user_data.get("draft")
     try:
         action, draft_id = query.data.split(":", 1)
@@ -503,6 +520,11 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await restart_draft(update.message, context, "Черновик сброшен. Пришли новое фото сделки и заметку.")
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ловит все необработанные исключения обработчиков, чтобы они не падали молча."""
+    logger.error("Необработанная ошибка при обработке %r", update, exc_info=context.error)
+
+
 def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
 
@@ -528,6 +550,7 @@ def main() -> None:
         )
     )
     application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_error_handler(error_handler)
 
     logger.info("Бот запущен, жду сообщения…")
     application.run_polling()

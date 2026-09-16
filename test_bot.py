@@ -1,6 +1,9 @@
 import unittest
+from unittest.mock import AsyncMock
 
-from bot import MAX_TELEGRAM_MESSAGE_LENGTH, split_telegram_text
+from telegram.error import BadRequest
+
+from bot import MAX_TELEGRAM_MESSAGE_LENGTH, safe_answer, split_telegram_text
 
 
 class SplitTelegramTextTests(unittest.TestCase):
@@ -18,6 +21,35 @@ class SplitTelegramTextTests(unittest.TestCase):
     def test_empty_text_is_rejected(self):
         with self.assertRaises(ValueError):
             split_telegram_text("   \n")
+
+
+class SafeAnswerTests(unittest.IsolatedAsyncioTestCase):
+    """Регрессия на баг: бот падал с необработанным исключением, если callback
+    (нажатие кнопки) устарел, например пока бот был выключен."""
+
+    async def test_swallows_stale_query_error(self):
+        query = AsyncMock()
+        query.answer.side_effect = BadRequest(
+            "Query is too old and response timeout expired or query id is invalid"
+        )
+
+        await safe_answer(query)  # не должно поднять исключение
+
+        query.answer.assert_awaited_once()
+
+    async def test_reraises_other_bad_request(self):
+        query = AsyncMock()
+        query.answer.side_effect = BadRequest("Some other Telegram error")
+
+        with self.assertRaises(BadRequest):
+            await safe_answer(query)
+
+    async def test_calls_through_on_success(self):
+        query = AsyncMock()
+
+        await safe_answer(query)
+
+        query.answer.assert_awaited_once()
 
 
 if __name__ == "__main__":
