@@ -44,6 +44,8 @@ ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
 CHANNEL_ID = os.environ["CHANNEL_ID"]
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 MAX_TELEGRAM_MESSAGE_LENGTH = 4096
+# У подписи к фото в Telegram лимит короче, чем у обычного текстового сообщения.
+MAX_TELEGRAM_CAPTION_LENGTH = 1024
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -227,19 +229,31 @@ def menu_keyboard() -> ReplyKeyboardMarkup:
 async def send_draft(
     message, context: ContextTypes.DEFAULT_TYPE, text: str, photo_file_id: str | None = None
 ) -> None:
-    """Отправить черновик (фото + текст + кнопки) и сохранить его в user_data."""
+    """Отправить черновик и сохранить его в user_data.
+
+    Если текст помещается в лимит подписи к фото — фото и текст уходят
+    одним сообщением (фото с подписью и кнопками). Если пост длиннее лимита
+    подписи — Telegram не позволяет уместить его в одно сообщение, тогда
+    фото и текст отправляются раздельно, как раньше.
+    """
     existing = context.user_data.get("draft")
     if photo_file_id is None:
         photo_file_id = existing["photo_file_id"] if existing else None
     if existing:
         await clear_draft_keyboard(context.bot, message.chat_id, existing)
 
-    await message.reply_photo(photo=photo_file_id)
-    chunks = split_telegram_text(text)
-    for chunk in chunks[:-1]:
-        await message.reply_text(chunk)
     draft_id = uuid4().hex
-    sent = await message.reply_text(chunks[-1], reply_markup=draft_keyboard(draft_id))
+    if len(text) <= MAX_TELEGRAM_CAPTION_LENGTH:
+        sent = await message.reply_photo(
+            photo=photo_file_id, caption=text, reply_markup=draft_keyboard(draft_id)
+        )
+    else:
+        await message.reply_photo(photo=photo_file_id)
+        chunks = split_telegram_text(text)
+        for chunk in chunks[:-1]:
+            await message.reply_text(chunk)
+        sent = await message.reply_text(chunks[-1], reply_markup=draft_keyboard(draft_id))
+
     context.user_data["draft"] = {
         "photo_file_id": photo_file_id,
         "raw_comment": existing.get("raw_comment") if existing else None,
@@ -389,9 +403,19 @@ async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def publish_draft(bot, draft: dict) -> None:
-    """Отправить черновик в канал."""
+    """Отправить черновик в канал.
+
+    Короткий пост уходит одним сообщением — фото с подписью. Длинный пост
+    (больше лимита подписи Telegram) отправляется как раньше: фото, а следом
+    текст отдельными сообщениями.
+    """
+    text = draft["formatted_text"]
+    if len(text) <= MAX_TELEGRAM_CAPTION_LENGTH:
+        await bot.send_photo(chat_id=CHANNEL_ID, photo=draft["photo_file_id"], caption=text)
+        return
+
     await bot.send_photo(chat_id=CHANNEL_ID, photo=draft["photo_file_id"])
-    for chunk in split_telegram_text(draft["formatted_text"]):
+    for chunk in split_telegram_text(text):
         await bot.send_message(chat_id=CHANNEL_ID, text=chunk)
 
 

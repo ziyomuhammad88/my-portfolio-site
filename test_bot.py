@@ -3,7 +3,14 @@ from unittest.mock import AsyncMock
 
 from telegram.error import BadRequest
 
-from bot import MAX_TELEGRAM_MESSAGE_LENGTH, safe_answer, split_telegram_text
+from bot import (
+    CHANNEL_ID,
+    MAX_TELEGRAM_CAPTION_LENGTH,
+    MAX_TELEGRAM_MESSAGE_LENGTH,
+    publish_draft,
+    safe_answer,
+    split_telegram_text,
+)
 
 
 class SplitTelegramTextTests(unittest.TestCase):
@@ -50,6 +57,33 @@ class SafeAnswerTests(unittest.IsolatedAsyncioTestCase):
         await safe_answer(query)
 
         query.answer.assert_awaited_once()
+
+
+class PublishDraftTests(unittest.IsolatedAsyncioTestCase):
+    """Регрессия на баг: фото и текст поста уходили в канал двумя разными
+    сообщениями вместо одного (фото с подписью)."""
+
+    async def test_short_text_is_sent_as_single_photo_with_caption(self):
+        bot_mock = AsyncMock()
+        draft = {"photo_file_id": "file123", "formatted_text": "Короткий пост"}
+
+        await publish_draft(bot_mock, draft)
+
+        bot_mock.send_photo.assert_awaited_once_with(
+            chat_id=CHANNEL_ID, photo="file123", caption="Короткий пост"
+        )
+        bot_mock.send_message.assert_not_awaited()
+
+    async def test_long_text_is_sent_as_photo_then_separate_messages(self):
+        bot_mock = AsyncMock()
+        long_text = ("Сделка по плану. " * 100).strip()
+        self.assertGreater(len(long_text), MAX_TELEGRAM_CAPTION_LENGTH)
+        draft = {"photo_file_id": "file123", "formatted_text": long_text}
+
+        await publish_draft(bot_mock, draft)
+
+        bot_mock.send_photo.assert_awaited_once_with(chat_id=CHANNEL_ID, photo="file123")
+        bot_mock.send_message.assert_awaited()
 
 
 if __name__ == "__main__":
