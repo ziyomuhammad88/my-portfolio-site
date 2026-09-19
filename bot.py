@@ -46,6 +46,17 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
 CHANNEL_ID = os.environ["CHANNEL_ID"]
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+
+
+def parse_instruments(raw: str) -> list[str]:
+    """Разобрать список инструментов из переменной окружения (через запятую)."""
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+# Если список задан — на шаге "Инструмент" бот покажет кнопки вместо
+# свободного текста.
+INSTRUMENTS = parse_instruments(os.environ.get("INSTRUMENTS", ""))
+
 MAX_TELEGRAM_MESSAGE_LENGTH = 4096
 # У подписи к фото в Telegram лимит короче, чем у обычного текстового сообщения.
 MAX_TELEGRAM_CAPTION_LENGTH = 1024
@@ -239,6 +250,16 @@ def draft_keyboard(draft_id: str) -> InlineKeyboardMarkup:
     )
 
 
+def instrument_keyboard(instruments: list[str]) -> InlineKeyboardMarkup:
+    """Кнопки выбора инструмента (по 2 в ряд), индекс — в callback_data."""
+    buttons = [
+        InlineKeyboardButton(name, callback_data=f"instrument:{i}")
+        for i, name in enumerate(instruments)
+    ]
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    return InlineKeyboardMarkup(rows)
+
+
 def menu_keyboard() -> ReplyKeyboardMarkup:
     """Постоянное меню для действий с черновиком в личном чате с ботом."""
     return ReplyKeyboardMarkup(
@@ -429,7 +450,10 @@ async def ask_current_wizard_step(message, context: ContextTypes.DEFAULT_TYPE) -
         await message.reply_text("Пришли скриншот сделки (фото).")
         return
     if wizard["stage"] == "header":
-        _, prompt = HEADER_STEPS[wizard["header_index"]]
+        key, prompt = HEADER_STEPS[wizard["header_index"]]
+        if key == "instrument" and INSTRUMENTS:
+            await message.reply_text(prompt, reply_markup=instrument_keyboard(INSTRUMENTS))
+            return
         await message.reply_text(prompt)
         return
     total = wizard["answers"]["trade_count"]
@@ -654,6 +678,31 @@ async def safe_answer(query) -> None:
             raise
 
 
+async def handle_instrument_selection(query, context: ContextTypes.DEFAULT_TYPE, payload: str) -> None:
+    """Обработать нажатие кнопки с инструментом на шаге анкеты."""
+    wizard = context.user_data.get("wizard")
+    is_current_step = bool(
+        wizard
+        and wizard["stage"] == "header"
+        and HEADER_STEPS[wizard["header_index"]][0] == "instrument"
+    )
+    if not is_current_step:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Этот выбор уже не актуален.")
+        return
+
+    try:
+        instrument = INSTRUMENTS[int(payload)]
+    except (ValueError, IndexError):
+        await query.edit_message_reply_markup(reply_markup=None)
+        return
+
+    await query.edit_message_reply_markup(reply_markup=None)
+    wizard["answers"]["instrument"] = instrument
+    wizard["header_index"] += 1
+    await ask_current_wizard_step(query.message, context)
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query.from_user.id != ADMIN_USER_ID:
@@ -661,13 +710,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     await safe_answer(query)
-    draft = context.user_data.get("draft")
     try:
-        action, draft_id = query.data.split(":", 1)
+        action, payload = query.data.split(":", 1)
     except (AttributeError, ValueError):
         await query.edit_message_reply_markup(reply_markup=None)
         return
 
+    if action == "instrument":
+        await handle_instrument_selection(query, context, payload)
+        return
+
+    draft = context.user_data.get("draft")
+    draft_id = payload
     if not draft or draft_id != draft.get("id"):
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("Этот черновик уже устарел и не будет использован.")

@@ -1,5 +1,6 @@
+import types
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from telegram.error import BadRequest
 
@@ -9,7 +10,10 @@ from bot import (
     MAX_TELEGRAM_MESSAGE_LENGTH,
     MAX_TRADE_COUNT,
     build_raw_comment,
+    handle_instrument_selection,
+    instrument_keyboard,
     parse_direction,
+    parse_instruments,
     parse_trade_count,
     publish_draft,
     safe_answer,
@@ -188,6 +192,82 @@ class BuildRawCommentTests(unittest.TestCase):
         self.assertLess(comment.index("Сделка 1:"), comment.index("Сделка 2:"))
         self.assertIn("Направление: Шорт", comment)
         self.assertIn("Что получилось / ошибка: рано закрыл", comment)
+
+
+class ParseInstrumentsTests(unittest.TestCase):
+    def test_splits_and_trims_comma_separated_list(self):
+        self.assertEqual(
+            parse_instruments(" EURUSD, GBPUSD ,, XAUUSD "),
+            ["EURUSD", "GBPUSD", "XAUUSD"],
+        )
+
+    def test_empty_string_gives_empty_list(self):
+        self.assertEqual(parse_instruments(""), [])
+
+
+class InstrumentKeyboardTests(unittest.TestCase):
+    def test_two_buttons_per_row_with_correct_callback_data(self):
+        markup = instrument_keyboard(["EURUSD", "GBPUSD", "XAUUSD"])
+        rows = markup.inline_keyboard
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([b.text for b in rows[0]], ["EURUSD", "GBPUSD"])
+        self.assertEqual([b.callback_data for b in rows[0]], ["instrument:0", "instrument:1"])
+        self.assertEqual([b.text for b in rows[1]], ["XAUUSD"])
+        self.assertEqual(rows[1][0].callback_data, "instrument:2")
+
+
+def make_wizard_context(**wizard_overrides) -> types.SimpleNamespace:
+    wizard = {
+        "stage": "header",
+        "header_index": 0,
+        "trade_index": 0,
+        "trade_field_index": 0,
+        "photo_file_id": "photo1",
+        "answers": {},
+        "trades": [],
+        "current_trade": {},
+    }
+    wizard.update(wizard_overrides)
+    return types.SimpleNamespace(user_data={"wizard": wizard})
+
+
+class HandleInstrumentSelectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_valid_selection_stores_answer_and_advances(self):
+        context = make_wizard_context()
+        query = AsyncMock()
+        query.message = AsyncMock()
+
+        with patch("bot.INSTRUMENTS", ["EURUSD", "GBPUSD"]):
+            await handle_instrument_selection(query, context, "1")
+
+        wizard = context.user_data["wizard"]
+        self.assertEqual(wizard["answers"]["instrument"], "GBPUSD")
+        self.assertEqual(wizard["header_index"], 1)
+        query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
+        query.message.reply_text.assert_awaited_once()
+
+    async def test_stale_selection_when_no_wizard(self):
+        context = types.SimpleNamespace(user_data={})
+        query = AsyncMock()
+        query.message = AsyncMock()
+
+        await handle_instrument_selection(query, context, "0")
+
+        query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
+        query.message.reply_text.assert_awaited_once()
+        self.assertNotIn("wizard", context.user_data)
+
+    async def test_stale_selection_when_step_moved_on(self):
+        context = make_wizard_context(header_index=1)  # уже не на шаге "instrument"
+        query = AsyncMock()
+        query.message = AsyncMock()
+
+        with patch("bot.INSTRUMENTS", ["EURUSD", "GBPUSD"]):
+            await handle_instrument_selection(query, context, "0")
+
+        self.assertNotIn("instrument", context.user_data["wizard"]["answers"])
+        query.message.reply_text.assert_awaited_once()
 
 
 if __name__ == "__main__":
