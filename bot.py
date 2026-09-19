@@ -24,7 +24,13 @@ import asyncio
 import base64
 import logging
 import os
+import re
+import sqlite3
+from datetime import date, datetime, timedelta
+from datetime import time as dt_time
+from pathlib import Path
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
@@ -46,6 +52,18 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
 CHANNEL_ID = os.environ["CHANNEL_ID"]
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+
+# Часовой пояс для расписания отчётов (суббота/1-е число, 08:00) и для даты,
+# под которой сохраняется опубликованная сессия. "or" (не .get(..., default))
+# — чтобы пустое значение в .env тоже трактовалось как "используй дефолт".
+REPORT_TIMEZONE = os.environ.get("REPORT_TIMEZONE") or "Asia/Tashkent"
+
+# Файл базы данных истории опубликованных сессий (SQLite). По умолчанию —
+# рядом с bot.py. Содержит реальную торговую историю — никогда не коммитить
+# (см. .gitignore). Пустая строка в качестве пути открыла бы sqlite3
+# временную БД, которая исчезает при закрытии соединения, — поэтому "or",
+# а не .get(..., default).
+DB_PATH = os.environ.get("DB_PATH") or str(Path(__file__).resolve().parent / "history.db")
 
 
 def parse_csv_list(raw: str) -> list[str]:
@@ -84,6 +102,147 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpx2").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
+
+# --- История опубликованных сессий (для недельных/месячных отчётов) -------
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    published_at TEXT NOT NULL,
+    session_date TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    day_result_raw TEXT NOT NULL,
+    day_result_value REAL,
+    trade_count INTEGER NOT NULL,
+    news TEXT NOT NULL,
+    psych_mistakes TEXT NOT NULL,
+    context TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    trade_index INTEGER NOT NULL,
+    direction TEXT NOT NULL,
+    why TEXT NOT NULL,
+    stop TEXT NOT NULL,
+    take TEXT NOT NULL,
+    result_raw TEXT NOT NULL,
+    result_value REAL,
+    mistake TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_date ON sessions(session_date);
+CREATE INDEX IF NOT EXISTS idx_trades_session_id ON trades(session_id);
+"""
+
+
+def get_connection() -> sqlite3.Connection:
+    """Новое соединение с БД истории (не общий глобальный объект — так тесты
+    могут подменить DB_PATH на временный файл перед вызовом)."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db() -> None:
+    """Создать таблицы истории, если их ещё нет. Вызывается один раз при старте."""
+    conn = get_connection()
+    try:
+        conn.executescript(SCHEMA_SQL)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_session(answers: dict, trades: list[dict], session_date: str) -> int:
+    """Сохранить опубликованную сессию и её сделки. Возвращает id сессии."""
+    day_result_value = parse_signed_amount(answers["day_result"])
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO sessions "
+            "(published_at, session_date, instrument, day_result_raw, day_result_value, "
+            " trade_count, news, psych_mistakes, context) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                datetime.now(ZoneInfo(REPORT_TIMEZONE)).isoformat(),
+                session_date,
+                answers["instrument"],
+                answers["day_result"],
+                day_result_value,
+                answers["trade_count"],
+                answers["news"],
+                answers["psych_mistakes"],
+                answers["context"],
+            ),
+        )
+        session_id = cursor.lastrowid
+        for i, trade in enumerate(trades, start=1):
+            result_value = parse_signed_amount(trade["result"])
+            conn.execute(
+                "INSERT INTO trades "
+                "(session_id, trade_index, direction, why, stop, take, result_raw, "
+                " result_value, mistake) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    i,
+                    trade["direction"],
+                    trade["why"],
+                    trade["stop"],
+                    trade["take"],
+                    trade["result"],
+                    result_value,
+                    trade["mistake"],
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return session_id
+
+
+def get_sessions_in_range(start_date: str, end_date: str) -> list[dict]:
+    """Сессии за период [start_date, end_date] включительно (ISO 'YYYY-MM-DD'),
+    каждая — со вложенным списком "trades" (по порядку trade_index)."""
+    conn = get_connection()
+    try:
+        session_rows = conn.execute(
+            "SELECT * FROM sessions WHERE session_date BETWEEN ? AND ? ORDER BY session_date",
+            (start_date, end_date),
+        ).fetchall()
+
+        sessions = []
+        for row in session_rows:
+            session = dict(row)
+            trade_rows = conn.execute(
+                "SELECT * FROM trades WHERE session_id = ? ORDER BY trade_index",
+                (session["id"],),
+            ).fetchall()
+            session["trades"] = [dict(trade_row) for trade_row in trade_rows]
+            sessions.append(session)
+    finally:
+        conn.close()
+    return sessions
+
+
+def persist_published_session(draft: dict) -> None:
+    """Сохранить опубликованную сессию в историю (для будущих отчётов).
+
+    Ошибка только логируется, не показывается админу: пост уже ушёл в канал,
+    это важнее, чем не потерять запись локальной истории — её, при желании,
+    можно будет добавить руками позже.
+    """
+    try:
+        session_date = datetime.now(ZoneInfo(REPORT_TIMEZONE)).date().isoformat()
+        save_session(draft["answers"], draft["trades"], session_date)
+    except Exception:
+        logger.exception("Ошибка при сохранении сессии в историю")
+
+
+# --- Конец блока истории сессий -------------------------------------------
 
 # Gemini отдаёт OpenAI-совместимый API — просто указываем свой base_url и
 # обычный пакет openai работает как обычно.
@@ -244,6 +403,225 @@ def revise_post(
     )
 
 
+# --- Недельные/месячные отчёты ---------------------------------------------
+#
+# Вся арифметика (суммы, winrate, разбивка по инструментам) считается ниже
+# чистыми функциями на Python. Gemini дальше получает эти числа уже
+# готовыми и ничего не пересчитывает — та же дисциплина, что и в
+# SYSTEM_PROMPT ("не придумывай факты"), только теперь и для цифр.
+
+REPORT_SYSTEM_PROMPT = """\
+Ты — трейдер, который раз в неделю/месяц подводит итог в своём \
+Telegram-канале тем же живым, увлекательным языком практикующего трейдера, \
+что и в обычных постах — не сухим отчётом и не канцеляритом.
+
+Тебе присылают ГОТОВЫЕ, уже посчитанные цифры за период и сырой список \
+заметок об ошибках. Твоя единственная задача с числами — вставить их в \
+пост БЕЗ ИЗМЕНЕНИЙ, ничего не пересчитывая и не округляя по-своему. Твоя \
+единственная задача с заметками об ошибках — проанализировать их и назвать \
+ОДНУ главную повторяющуюся ошибку периода (или честно написать, что \
+чёткого паттерна нет, если заметок мало или они все разные).
+
+Оформи пост по такой структуре:
+
+[Заголовок периода, например "Итоги недели" или "Итоги месяца"], [даты периода].
+
+Итог за период: [сумма из данных].
+Сделок: [число из данных].
+Winrate: [процент из данных, или "недостаточно данных", если он не посчитан].
+
+По инструментам:
+[по каждому инструменту из данных — одна строка: название, чистый \
+результат, и коротко хорошо/плохо шло дело]
+
+Главная ошибка периода:
+[1-2 абзаца — твой анализ по заметкам: назови ОДНУ повторяющуюся ошибку и \
+коротко разверни, в чём она проявлялась. Если заметок недостаточно, честно \
+скажи об этом, а не выдумывай.]
+
+[Финал — 1-2 предложения вывода/мотивации на следующий период, можно с \
+одним уместным эмодзи.]
+
+Правила:
+- Числа (суммы, число сделок, winrate, по инструментам) бери СТРОГО из \
+переданных данных — никогда не пересчитывай, не округляй иначе и не \
+выдумывай ни одной цифры сверх того, что дано.
+- Анализ главной ошибки — единственное место, где ты рассуждаешь сам, но \
+только по переданным заметкам, не придумывая ошибок, которых там нет.
+- Только обычный текст, без Markdown и HTML-разметки.
+- По-русски.
+- Без хэштегов, приветствий, подписей и дисклеймеров — только сам пост.
+- В ответе — только текст поста, без пояснений от себя.
+- Длина готового поста — до 3 500 символов.
+"""
+
+NO_MISTAKES_PLACEHOLDER = "За период психологических ошибок и ошибок по сделкам не отмечено."
+
+
+def aggregate_report_stats(sessions: list[dict], start_date: str, end_date: str) -> dict:
+    """Посчитать статистику за период из списка сессий (формат — как
+    возвращает get_sessions_in_range). Вся арифметика — здесь; дальше эти
+    числа передаются в Gemini уже готовыми."""
+    trade_count = 0
+    wins = losses = breakevens = unparseable_trades = 0
+    total_result = 0.0
+    unparseable_day_results = 0
+    instruments: dict[str, dict] = {}
+
+    for session in sessions:
+        stat = instruments.setdefault(
+            session["instrument"],
+            {
+                "trade_count": 0,
+                "wins": 0,
+                "losses": 0,
+                "breakevens": 0,
+                "unparseable": 0,
+                "net_result": 0.0,
+                "parsed_day_count": 0,
+            },
+        )
+
+        if session["day_result_value"] is None:
+            unparseable_day_results += 1
+        else:
+            total_result += session["day_result_value"]
+            stat["net_result"] += session["day_result_value"]
+            stat["parsed_day_count"] += 1
+
+        for trade in session["trades"]:
+            trade_count += 1
+            stat["trade_count"] += 1
+            outcome = classify_trade_outcome(trade["result_value"])
+            if outcome == "win":
+                wins += 1
+                stat["wins"] += 1
+            elif outcome == "loss":
+                losses += 1
+                stat["losses"] += 1
+            elif outcome == "breakeven":
+                breakevens += 1
+                stat["breakevens"] += 1
+            else:
+                unparseable_trades += 1
+                stat["unparseable"] += 1
+
+    winrate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else None
+
+    instrument_stats = {}
+    for name, stat in instruments.items():
+        denom = stat["wins"] + stat["losses"]
+        instrument_winrate = (stat["wins"] / denom * 100) if denom > 0 else None
+        # Нет ни одного распознанного дневного итога ИЛИ чистый результат
+        # ровно ноль — недостаточно сигнала, чтобы честно назвать "хорошо"
+        # или "плохо" (а не наоборот, "недостаточно данных" аккуратно
+        # отличается от "0 из-за отсутствия чисел").
+        if stat["parsed_day_count"] == 0 or stat["net_result"] == 0:
+            verdict = "insufficient_data"
+        elif stat["net_result"] > 0:
+            verdict = "good"
+        else:
+            verdict = "bad"
+        instrument_stats[name] = {
+            "trade_count": stat["trade_count"],
+            "wins": stat["wins"],
+            "losses": stat["losses"],
+            "breakevens": stat["breakevens"],
+            "unparseable": stat["unparseable"],
+            "net_result": stat["net_result"],
+            "winrate": instrument_winrate,
+            "verdict": verdict,
+        }
+
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "session_count": len(sessions),
+        "trade_count": trade_count,
+        "total_result": total_result,
+        "unparseable_day_results": unparseable_day_results,
+        "wins": wins,
+        "losses": losses,
+        "breakevens": breakevens,
+        "unparseable_trades": unparseable_trades,
+        "winrate": winrate,
+        "instruments": instrument_stats,
+    }
+
+
+def collect_mistake_notes(sessions: list[dict]) -> str:
+    """Собрать психологические ошибки и ошибки по сделкам за период в один
+    текстовый блок с датой/инструментом на каждой строке — сырой материал
+    для анализа паттерна в Gemini. Значения вида "нет"/пустые пропускаются."""
+    skip_values = {"", "нет", "нету", "-", "—"}
+    lines = []
+    for session in sessions:
+        label = f"{session['session_date']} ({session['instrument']})"
+        psych = session["psych_mistakes"].strip()
+        if psych.lower() not in skip_values:
+            lines.append(f"{label} — психология: {psych}")
+        for trade in session["trades"]:
+            mistake = trade["mistake"].strip()
+            if mistake.lower() not in skip_values:
+                lines.append(f"{label} — сделка: {mistake}")
+    return "\n".join(lines)
+
+
+def _format_instrument_line(name: str, stat: dict) -> str:
+    winrate_text = f"{stat['winrate']:.0f}%" if stat["winrate"] is not None else "недостаточно данных"
+    verdict_text = {
+        "good": "хорошо",
+        "bad": "плохо",
+        "insufficient_data": "недостаточно данных",
+    }[stat["verdict"]]
+    return (
+        f"{name}: {stat['net_result']:+.0f}$ ({stat['trade_count']} сделок, "
+        f"winrate {winrate_text}) — {verdict_text}"
+    )
+
+
+def _format_report_user_message(period_label: str, stats: dict, mistake_notes: str) -> str:
+    """Чистая сериализация готовых чисел в текст запроса к Gemini —
+    отделена от build_report_text, чтобы тестироваться без вызова API."""
+    winrate_text = f"{stats['winrate']:.0f}%" if stats["winrate"] is not None else "недостаточно данных"
+
+    lines = [
+        f"Период: {period_label} ({stats['start_date']} — {stats['end_date']}).",
+        f"Итог за период: {stats['total_result']:+.0f}$.",
+        f"Сделок: {stats['trade_count']}.",
+        f"Winrate: {winrate_text}.",
+        "",
+        "По инструментам:",
+    ]
+    if stats["instruments"]:
+        lines.extend(
+            _format_instrument_line(name, stat) for name, stat in stats["instruments"].items()
+        )
+    else:
+        lines.append("Сделок за период не было.")
+
+    lines.append("")
+    lines.append("Заметки об ошибках за период:")
+    lines.append(mistake_notes)
+
+    return "\n".join(lines)
+
+
+def build_report_text(period_label: str, stats: dict, mistake_notes: str) -> str:
+    """Оформить отчёт по готовым цифрам через Gemini (тот же клиент и \
+таймаут, что и для обычных постов)."""
+    user_message = _format_report_user_message(period_label, stats, mistake_notes)
+    return get_completion(
+        [
+            {"role": "system", "content": REPORT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ]
+    )
+
+
+# --- Конец блока отчётов -----------------------------------------------
+
+
 def is_admin(update: Update) -> bool:
     return update.effective_user is not None and update.effective_user.id == ADMIN_USER_ID
 
@@ -268,12 +646,40 @@ def split_telegram_text(text: str) -> list[str]:
     return chunks
 
 
+def week_report_range(today: date) -> tuple[str, str]:
+    """Последние 7 календарных дней, не считая сегодня — (today-7, today-1)."""
+    start = today - timedelta(days=7)
+    end = today - timedelta(days=1)
+    return start.isoformat(), end.isoformat()
+
+
+def month_report_range(today: date) -> tuple[str, str]:
+    """Весь предыдущий календарный месяц целиком."""
+    first_of_this_month = today.replace(day=1)
+    last_day_of_prev_month = first_of_this_month - timedelta(days=1)
+    first_day_of_prev_month = last_day_of_prev_month.replace(day=1)
+    return first_day_of_prev_month.isoformat(), last_day_of_prev_month.isoformat()
+
+
 def draft_keyboard(draft_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton("✅ Опубликовать", callback_data=f"publish:{draft_id}"),
                 InlineKeyboardButton("❌ Отмена", callback_data=f"cancel:{draft_id}"),
+            ]
+        ]
+    )
+
+
+def report_draft_keyboard(draft_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Опубликовать", callback_data=f"report_publish:{draft_id}"
+                ),
+                InlineKeyboardButton("❌ Отмена", callback_data=f"report_cancel:{draft_id}"),
             ]
         ]
     )
@@ -331,6 +737,8 @@ async def send_draft(
     context.user_data["draft"] = {
         "photo_file_id": photo_file_id,
         "raw_comment": existing.get("raw_comment") if existing else None,
+        "answers": existing.get("answers") if existing else None,
+        "trades": existing.get("trades") if existing else None,
         "formatted_text": text,
         "message_id": sent.message_id,
         "id": draft_id,
@@ -350,15 +758,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "написать текст правки следующим сообщением, без команды)\n"
         "/post — опубликовать текущий черновик в канал\n"
         "/stop — отменить текущий опрос или черновик\n"
-        "/restart — начать заново",
+        "/restart — начать заново\n"
+        "/weekreport — отчёт за последние 7 дней\n"
+        "/monthreport — отчёт за прошлый календарный месяц\n\n"
+        "Отчёты приходят и сами: по субботам в 8:00 — недельный, "
+        "1-го числа в 8:00 — месячный.",
         reply_markup=menu_keyboard(),
     )
 
 
 async def create_draft_from_source(
-    message, context: ContextTypes.DEFAULT_TYPE, raw_comment: str, photo_file_id: str
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    raw_comment: str,
+    photo_file_id: str,
+    answers: dict,
+    trades: list[dict],
 ) -> bool:
-    """Собрать черновик из исходной заметки и скриншота сделки."""
+    """Собрать черновик из исходной заметки и скриншота сделки.
+
+    answers/trades — структурированные ответы анкеты (не только текст
+    raw_comment) — сохраняются в черновик, чтобы при публикации записать их
+    в историю (save_session) для недельных/месячных отчётов.
+    """
     await message.reply_text("Оформляю пост…")
     try:
         photo = await context.bot.get_file(photo_file_id)
@@ -374,6 +796,8 @@ async def create_draft_from_source(
 
     await send_draft(message, context, formatted_text, photo_file_id)
     context.user_data["draft"]["raw_comment"] = raw_comment
+    context.user_data["draft"]["answers"] = answers
+    context.user_data["draft"]["trades"] = trades
     await message.reply_text(
         "Если нужно что-то поправить — напиши следующим сообщением или "
         "командой /edit, что изменить. Когда всё устроит — жми «✅ Опубликовать» "
@@ -432,6 +856,32 @@ def parse_direction(text: str) -> str | None:
     if normalized in ("шорт", "short", "ш"):
         return "Шорт"
     return None
+
+
+_SIGNED_AMOUNT_PATTERN = re.compile(r"[+-]?\d+(?:[.,]\d+)?")
+
+
+def parse_signed_amount(text: str) -> float | None:
+    """Извлечь знаковое число из свободного текста результата
+    ("-80$", "+150 $", "0", "-15 пунктов"). Берёт первое совпадение вида
+    [+-]?\\d+(?:[.,]\\d+)? — запятая считается десятичным разделителем.
+    Число без явного знака ("80") возвращается как положительное. Если в
+    тексте вообще нет числа — None (например, "минус восемьдесят" или "нет")."""
+    match = _SIGNED_AMOUNT_PATTERN.search(text)
+    if match is None:
+        return None
+    return float(match.group().replace(",", "."))
+
+
+def classify_trade_outcome(result_value: float | None) -> str:
+    """'win' | 'loss' | 'breakeven' | 'unparseable' — используется для winrate."""
+    if result_value is None:
+        return "unparseable"
+    if result_value > 0:
+        return "win"
+    if result_value < 0:
+        return "loss"
+    return "breakeven"
 
 
 def build_raw_comment(answers: dict, trades: list[dict]) -> str:
@@ -504,7 +954,9 @@ async def finish_wizard(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Опрос закончен — собрать заметку и передать в обычный пайплайн оформления."""
     wizard = context.user_data.pop("wizard")
     raw_comment = build_raw_comment(wizard["answers"], wizard["trades"])
-    await create_draft_from_source(message, context, raw_comment, wizard["photo_file_id"])
+    await create_draft_from_source(
+        message, context, raw_comment, wizard["photo_file_id"], wizard["answers"], wizard["trades"]
+    )
 
 
 async def handle_wizard_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -678,6 +1130,43 @@ async def publish_draft(bot, draft: dict) -> None:
         await bot.send_message(chat_id=CHANNEL_ID, text=chunk)
 
 
+async def send_report_draft(
+    context: ContextTypes.DEFAULT_TYPE, period_label: str, text: str
+) -> None:
+    """Прислать черновик отчёта админу в личку на подтверждение.
+
+    В отличие от обычного черновика (send_draft) — без фото (у недели/месяца
+    нет одного скриншота), поэтому всегда через чанки split_telegram_text, а
+    не через photo-caption ветку. Хранится отдельно от дневного
+    context.user_data["draft"], чтобы не пересекаться с ним.
+    """
+    existing = context.user_data.get("report_draft")
+    if existing:
+        await clear_draft_keyboard(context.bot, ADMIN_USER_ID, existing)
+
+    draft_id = uuid4().hex
+    chunks = split_telegram_text(text)
+    for chunk in chunks[:-1]:
+        await context.bot.send_message(chat_id=ADMIN_USER_ID, text=chunk)
+    sent = await context.bot.send_message(
+        chat_id=ADMIN_USER_ID, text=chunks[-1], reply_markup=report_draft_keyboard(draft_id)
+    )
+
+    context.user_data["report_draft"] = {
+        "period_label": period_label,
+        "formatted_text": text,
+        "message_id": sent.message_id,
+        "id": draft_id,
+    }
+
+
+async def publish_report(bot, report_draft: dict) -> None:
+    """Отправить готовый отчёт в канал (текстом, чанками — как publish_draft,
+    но без фото)."""
+    for chunk in split_telegram_text(report_draft["formatted_text"]):
+        await bot.send_message(chat_id=CHANNEL_ID, text=chunk)
+
+
 async def clear_draft_keyboard(bot, chat_id: int, draft: dict) -> None:
     """Убрать кнопки под последним сообщением-черновиком (если оно ещё есть)."""
     if not draft.get("message_id"):
@@ -741,6 +1230,36 @@ async def handle_header_choice_selection(
     await ask_current_wizard_step(query.message, context)
 
 
+async def handle_report_callback(
+    query, context: ContextTypes.DEFAULT_TYPE, action: str, draft_id: str
+) -> None:
+    """Обработать подтверждение/отмену черновика отчёта — зеркало обычной
+    publish/cancel-логики в handle_callback, но для отдельного
+    context.user_data["report_draft"]."""
+    report_draft = context.user_data.get("report_draft")
+    if not report_draft or draft_id != report_draft.get("id"):
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Этот черновик отчёта уже устарел и не будет использован.")
+        return
+
+    if action == "report_publish":
+        try:
+            await publish_report(context.bot, report_draft)
+        except Exception:
+            logger.exception("Ошибка при публикации отчёта")
+            await query.message.reply_text(
+                "Не удалось опубликовать отчёт. Проверь права бота в канале и попробуй ещё раз."
+            )
+            return
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Отчёт опубликован в канале ✅")
+    else:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Отчёт отменён.")
+
+    context.user_data.pop("report_draft", None)
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query.from_user.id != ADMIN_USER_ID:
@@ -756,6 +1275,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if action in HEADER_CHOICE_OPTIONS:
         await handle_header_choice_selection(query, context, action, payload)
+        return
+
+    if action in ("report_publish", "report_cancel"):
+        await handle_report_callback(query, context, action, payload)
         return
 
     draft = context.user_data.get("draft")
@@ -774,6 +1297,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "Не удалось опубликовать пост. Проверь права бота в канале и попробуй ещё раз."
             )
             return
+        persist_published_session(draft)
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("Опубликовано в канале ✅")
         context.user_data.pop("draft", None)
@@ -801,6 +1325,7 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "Не удалось опубликовать пост. Проверь права бота в канале и попробуй ещё раз."
         )
         return
+    persist_published_session(draft)
     await clear_draft_keyboard(context.bot, update.effective_chat.id, draft)
     await update.message.reply_text("Опубликовано в канале ✅")
     context.user_data.pop("draft", None)
@@ -832,12 +1357,69 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await begin_wizard(update.message, context, "Черновик сброшен. Начинаем заново.")
 
 
+async def run_report_pipeline(
+    context: ContextTypes.DEFAULT_TYPE, period_label: str, start_date: str, end_date: str
+) -> None:
+    """Общий пайплайн отчёта: БД -> агрегация -> Gemini -> черновик на
+    подтверждение. Используется и планировщиком, и ручными командами."""
+    sessions = get_sessions_in_range(start_date, end_date)
+    stats = aggregate_report_stats(sessions, start_date, end_date)
+    mistake_notes = collect_mistake_notes(sessions) or NO_MISTAKES_PLACEHOLDER
+
+    await context.bot.send_message(chat_id=ADMIN_USER_ID, text=f"Готовлю отчёт: {period_label}…")
+    try:
+        report_text = await asyncio.to_thread(build_report_text, period_label, stats, mistake_notes)
+    except Exception:
+        logger.exception("Ошибка при подготовке отчёта")
+        await context.bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text="Не получилось подготовить отчёт. Проверь подключение, GEMINI_API_KEY "
+            "и попробуй ещё раз.",
+        )
+        return
+    await send_report_draft(context, period_label, report_text)
+
+
+async def weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Плановый недельный отчёт — суббота 08:00 (REPORT_TIMEZONE)."""
+    today = datetime.now(ZoneInfo(REPORT_TIMEZONE)).date()
+    start_date, end_date = week_report_range(today)
+    await run_report_pipeline(context, f"Неделя {start_date} — {end_date}", start_date, end_date)
+
+
+async def monthly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Плановый месячный отчёт — 1-е число, 08:00 (REPORT_TIMEZONE)."""
+    today = datetime.now(ZoneInfo(REPORT_TIMEZONE)).date()
+    start_date, end_date = month_report_range(today)
+    await run_report_pipeline(context, f"Месяц {start_date} — {end_date}", start_date, end_date)
+
+
+async def weekreport_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ручной запуск недельного отчёта (тот же диапазон, что и по расписанию)."""
+    if not is_admin(update):
+        return
+    today = datetime.now(ZoneInfo(REPORT_TIMEZONE)).date()
+    start_date, end_date = week_report_range(today)
+    await run_report_pipeline(context, f"Неделя {start_date} — {end_date}", start_date, end_date)
+
+
+async def monthreport_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ручной запуск месячного отчёта (тот же диапазон, что и по расписанию)."""
+    if not is_admin(update):
+        return
+    today = datetime.now(ZoneInfo(REPORT_TIMEZONE)).date()
+    start_date, end_date = month_report_range(today)
+    await run_report_pipeline(context, f"Месяц {start_date} — {end_date}", start_date, end_date)
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Ловит все необработанные исключения обработчиков, чтобы они не падали молча."""
     logger.error("Необработанная ошибка при обработке %r", update, exc_info=context.error)
 
 
 def main() -> None:
+    init_db()
+
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
@@ -854,6 +1436,12 @@ def main() -> None:
         CommandHandler("restart", restart_command, filters.ChatType.PRIVATE)
     )
     application.add_handler(
+        CommandHandler("weekreport", weekreport_command, filters.ChatType.PRIVATE)
+    )
+    application.add_handler(
+        CommandHandler("monthreport", monthreport_command, filters.ChatType.PRIVATE)
+    )
+    application.add_handler(
         MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_photo)
     )
     application.add_handler(
@@ -863,6 +1451,30 @@ def main() -> None:
     )
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_error_handler(error_handler)
+
+    if application.job_queue is not None:
+        tz = ZoneInfo(REPORT_TIMEZONE)
+        application.job_queue.run_daily(
+            weekly_report_job,
+            time=dt_time(hour=8, minute=0, tzinfo=tz),
+            days=(6,),  # PTB v20+: 0=воскресенье ... 6=суббота
+            chat_id=ADMIN_USER_ID,
+            user_id=ADMIN_USER_ID,
+            name="weekly_report",
+        )
+        application.job_queue.run_monthly(
+            monthly_report_job,
+            when=dt_time(hour=8, minute=0, tzinfo=tz),
+            day=1,
+            chat_id=ADMIN_USER_ID,
+            user_id=ADMIN_USER_ID,
+            name="monthly_report",
+        )
+    else:
+        logger.warning(
+            "job_queue недоступен — переустанови зависимости "
+            '(нужен python-telegram-bot[job-queue]), иначе отчёты по расписанию не будут работать.'
+        )
 
     logger.info("Бот запущен, жду сообщения…")
     application.run_polling()
