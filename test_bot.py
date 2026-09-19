@@ -130,6 +130,7 @@ class BuildRawCommentTests(unittest.TestCase):
             "day_result": "-80$",
             "trade_count": 1,
             "news": "нет",
+            "psych_mistakes": "пересидел сделку",
             "context": "нет",
         }
         trade = {
@@ -150,6 +151,7 @@ class BuildRawCommentTests(unittest.TestCase):
         self.assertIn("Сделка 1:", comment)
         self.assertIn("Направление: Лонг", comment)
         self.assertIn("Что получилось / ошибка: рано вошёл", comment)
+        self.assertIn("Психологические ошибки: пересидел сделку", comment)
 
     def test_multiple_trades_are_all_included_in_order(self):
         answers = {
@@ -157,6 +159,7 @@ class BuildRawCommentTests(unittest.TestCase):
             "day_result": "-100$",
             "trade_count": 2,
             "news": "нет",
+            "psych_mistakes": "нет",
             "context": "нет",
         }
         trades = [
