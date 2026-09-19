@@ -139,7 +139,6 @@ class BuildRawCommentTests(unittest.TestCase):
         }
         trade = {
             "direction": "Лонг",
-            "level": "1.0850",
             "why": "отбой от диапазона",
             "stop": "1.0835",
             "take": "1.0880",
@@ -169,7 +168,6 @@ class BuildRawCommentTests(unittest.TestCase):
         trades = [
             {
                 "direction": "Лонг",
-                "level": "0.6500",
                 "why": "сигнал 1",
                 "stop": "0.6490",
                 "take": "0.6520",
@@ -178,7 +176,6 @@ class BuildRawCommentTests(unittest.TestCase):
             },
             {
                 "direction": "Шорт",
-                "level": "0.6530",
                 "why": "сигнал 2",
                 "stop": "0.6540",
                 "take": "0.6500",
