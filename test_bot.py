@@ -22,7 +22,6 @@ from bot import (
     get_completion,
     get_sessions_in_range,
     handle_header_choice_selection,
-    handle_report_callback,
     init_db,
     month_report_range,
     parse_csv_list,
@@ -31,7 +30,6 @@ from bot import (
     parse_trade_count,
     publish_draft,
     publish_report,
-    report_draft_keyboard,
     _format_report_user_message,
     safe_answer,
     save_session,
@@ -583,83 +581,16 @@ class BuildReportTextTests(unittest.TestCase):
         self.assertIn("заметка", messages[1]["content"])
 
 
-class ReportDraftKeyboardTests(unittest.TestCase):
-    def test_uses_report_prefixed_callback_data(self):
-        markup = report_draft_keyboard("abc123")
-        buttons = markup.inline_keyboard[0]
-
-        self.assertEqual(buttons[0].callback_data, "report_publish:abc123")
-        self.assertEqual(buttons[1].callback_data, "report_cancel:abc123")
-
-
 class PublishReportTests(unittest.IsolatedAsyncioTestCase):
     async def test_sends_chunked_text_no_photo(self):
         bot_mock = AsyncMock()
-        report_draft = {"formatted_text": "Итоги недели: всё по плану."}
 
-        await publish_report(bot_mock, report_draft)
+        await publish_report(bot_mock, "Итоги недели: всё по плану.")
 
         bot_mock.send_message.assert_awaited_once_with(
             chat_id=CHANNEL_ID, text="Итоги недели: всё по плану."
         )
         bot_mock.send_photo.assert_not_called()
-
-
-def make_report_draft_context(**overrides) -> types.SimpleNamespace:
-    report_draft = {
-        "period_label": "Неделя 2026-09-12 — 2026-09-18",
-        "formatted_text": "Текст отчёта",
-        "message_id": 10,
-        "id": "draft-id",
-    }
-    report_draft.update(overrides)
-    return types.SimpleNamespace(user_data={"report_draft": report_draft}, bot=AsyncMock())
-
-
-class HandleReportCallbackTests(unittest.IsolatedAsyncioTestCase):
-    async def test_publish_calls_publish_report_and_clears_draft(self):
-        context = make_report_draft_context()
-        query = AsyncMock()
-        query.message = AsyncMock()
-
-        with patch("bot.publish_report", new=AsyncMock()) as publish_mock:
-            await handle_report_callback(query, context, "report_publish", "draft-id")
-
-        publish_mock.assert_awaited_once()
-        self.assertNotIn("report_draft", context.user_data)
-        query.message.reply_text.assert_awaited_once()
-
-    async def test_cancel_clears_draft_without_publishing(self):
-        context = make_report_draft_context()
-        query = AsyncMock()
-        query.message = AsyncMock()
-
-        with patch("bot.publish_report", new=AsyncMock()) as publish_mock:
-            await handle_report_callback(query, context, "report_cancel", "draft-id")
-
-        publish_mock.assert_not_awaited()
-        self.assertNotIn("report_draft", context.user_data)
-
-    async def test_stale_draft_id_does_not_publish(self):
-        context = make_report_draft_context()
-        query = AsyncMock()
-        query.message = AsyncMock()
-
-        with patch("bot.publish_report", new=AsyncMock()) as publish_mock:
-            await handle_report_callback(query, context, "report_publish", "old-id")
-
-        publish_mock.assert_not_awaited()
-        query.message.reply_text.assert_awaited_once()
-
-    async def test_no_report_draft_at_all(self):
-        context = types.SimpleNamespace(user_data={}, bot=AsyncMock())
-        query = AsyncMock()
-        query.message = AsyncMock()
-
-        with patch("bot.publish_report", new=AsyncMock()) as publish_mock:
-            await handle_report_callback(query, context, "report_publish", "any-id")
-
-        publish_mock.assert_not_awaited()
 
 
 def make_callback_update(data: str, user_id: int | None = None):
@@ -674,26 +605,9 @@ def make_callback_update(data: str, user_id: int | None = None):
 
 
 class HandleCallbackDispatchTests(unittest.IsolatedAsyncioTestCase):
-    """Проверяет, что report_publish:/report_cancel: маршрутизируются в
-    handle_report_callback и не ломают существующую publish:/cancel: логику."""
-
-    async def test_routes_report_publish_to_handle_report_callback(self):
-        update, query = make_callback_update("report_publish:abc")
-        context = types.SimpleNamespace(user_data={}, bot=AsyncMock())
-
-        with patch("bot.handle_report_callback", new=AsyncMock()) as handler_mock:
-            await bot.handle_callback(update, context)
-
-        handler_mock.assert_awaited_once_with(query, context, "report_publish", "abc")
-
-    async def test_routes_report_cancel_to_handle_report_callback(self):
-        update, query = make_callback_update("report_cancel:abc")
-        context = types.SimpleNamespace(user_data={}, bot=AsyncMock())
-
-        with patch("bot.handle_report_callback", new=AsyncMock()) as handler_mock:
-            await bot.handle_callback(update, context)
-
-        handler_mock.assert_awaited_once_with(query, context, "report_cancel", "abc")
+    """Регрессионный тест: publish:/cancel: по-прежнему маршрутизируются в
+    обычную логику дневного черновика (handle_header_choice_selection'у не
+    должны попадать посторонние action)."""
 
     async def test_existing_publish_action_still_routes_to_daily_draft_logic(self):
         update, query = make_callback_update("publish:draft-1")
@@ -713,6 +627,43 @@ class HandleCallbackDispatchTests(unittest.IsolatedAsyncioTestCase):
 
         publish_mock.assert_awaited_once()
         self.assertNotIn("draft", context.user_data)
+
+
+class RunReportPipelineTests(unittest.IsolatedAsyncioTestCase):
+    """Отчёты публикуются сразу, без подтверждения — только уведомления
+    админу по ходу."""
+
+    async def test_auto_publishes_and_notifies_admin(self):
+        context = types.SimpleNamespace(user_data={}, bot=AsyncMock())
+
+        with patch("bot.get_sessions_in_range", return_value=[]), patch(
+            "bot.build_report_text", return_value="Готовый отчёт"
+        ), patch("bot.publish_report", new=AsyncMock()) as publish_mock:
+            await bot.run_report_pipeline(context, "Неделя", "2026-09-01", "2026-09-07")
+
+        publish_mock.assert_awaited_once_with(context.bot, "Готовый отчёт")
+        self.assertGreaterEqual(context.bot.send_message.await_count, 2)
+
+    async def test_gemini_failure_notifies_admin_without_publishing(self):
+        context = types.SimpleNamespace(user_data={}, bot=AsyncMock())
+
+        with patch("bot.get_sessions_in_range", return_value=[]), patch(
+            "bot.build_report_text", side_effect=RuntimeError("boom")
+        ), patch("bot.publish_report", new=AsyncMock()) as publish_mock:
+            await bot.run_report_pipeline(context, "Неделя", "2026-09-01", "2026-09-07")
+
+        publish_mock.assert_not_awaited()
+
+    async def test_publish_failure_notifies_admin(self):
+        context = types.SimpleNamespace(user_data={}, bot=AsyncMock())
+
+        with patch("bot.get_sessions_in_range", return_value=[]), patch(
+            "bot.build_report_text", return_value="Готовый отчёт"
+        ), patch("bot.publish_report", new=AsyncMock(side_effect=RuntimeError("no rights"))):
+            await bot.run_report_pipeline(context, "Неделя", "2026-09-01", "2026-09-07")
+
+        last_call_text = context.bot.send_message.call_args.kwargs["text"]
+        self.assertIn("Не удалось опубликовать", last_call_text)
 
 
 class SendDraftPreservesStructuredDataTests(unittest.IsolatedAsyncioTestCase):

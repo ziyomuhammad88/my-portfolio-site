@@ -672,19 +672,6 @@ def draft_keyboard(draft_id: str) -> InlineKeyboardMarkup:
     )
 
 
-def report_draft_keyboard(draft_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "✅ Опубликовать", callback_data=f"report_publish:{draft_id}"
-                ),
-                InlineKeyboardButton("❌ Отмена", callback_data=f"report_cancel:{draft_id}"),
-            ]
-        ]
-    )
-
-
 def choice_keyboard(options: list[str], callback_prefix: str) -> InlineKeyboardMarkup:
     """Кнопки выбора одного варианта из списка (по 2 в ряд), индекс — в callback_data."""
     buttons = [
@@ -1130,40 +1117,10 @@ async def publish_draft(bot, draft: dict) -> None:
         await bot.send_message(chat_id=CHANNEL_ID, text=chunk)
 
 
-async def send_report_draft(
-    context: ContextTypes.DEFAULT_TYPE, period_label: str, text: str
-) -> None:
-    """Прислать черновик отчёта админу в личку на подтверждение.
-
-    В отличие от обычного черновика (send_draft) — без фото (у недели/месяца
-    нет одного скриншота), поэтому всегда через чанки split_telegram_text, а
-    не через photo-caption ветку. Хранится отдельно от дневного
-    context.user_data["draft"], чтобы не пересекаться с ним.
-    """
-    existing = context.user_data.get("report_draft")
-    if existing:
-        await clear_draft_keyboard(context.bot, ADMIN_USER_ID, existing)
-
-    draft_id = uuid4().hex
-    chunks = split_telegram_text(text)
-    for chunk in chunks[:-1]:
-        await context.bot.send_message(chat_id=ADMIN_USER_ID, text=chunk)
-    sent = await context.bot.send_message(
-        chat_id=ADMIN_USER_ID, text=chunks[-1], reply_markup=report_draft_keyboard(draft_id)
-    )
-
-    context.user_data["report_draft"] = {
-        "period_label": period_label,
-        "formatted_text": text,
-        "message_id": sent.message_id,
-        "id": draft_id,
-    }
-
-
-async def publish_report(bot, report_draft: dict) -> None:
-    """Отправить готовый отчёт в канал (текстом, чанками — как publish_draft,
-    но без фото)."""
-    for chunk in split_telegram_text(report_draft["formatted_text"]):
+async def publish_report(bot, text: str) -> None:
+    """Отправить готовый отчёт в канал сразу, без подтверждения (текстом,
+    чанками — как publish_draft, но без фото)."""
+    for chunk in split_telegram_text(text):
         await bot.send_message(chat_id=CHANNEL_ID, text=chunk)
 
 
@@ -1230,36 +1187,6 @@ async def handle_header_choice_selection(
     await ask_current_wizard_step(query.message, context)
 
 
-async def handle_report_callback(
-    query, context: ContextTypes.DEFAULT_TYPE, action: str, draft_id: str
-) -> None:
-    """Обработать подтверждение/отмену черновика отчёта — зеркало обычной
-    publish/cancel-логики в handle_callback, но для отдельного
-    context.user_data["report_draft"]."""
-    report_draft = context.user_data.get("report_draft")
-    if not report_draft or draft_id != report_draft.get("id"):
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text("Этот черновик отчёта уже устарел и не будет использован.")
-        return
-
-    if action == "report_publish":
-        try:
-            await publish_report(context.bot, report_draft)
-        except Exception:
-            logger.exception("Ошибка при публикации отчёта")
-            await query.message.reply_text(
-                "Не удалось опубликовать отчёт. Проверь права бота в канале и попробуй ещё раз."
-            )
-            return
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text("Отчёт опубликован в канале ✅")
-    else:
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text("Отчёт отменён.")
-
-    context.user_data.pop("report_draft", None)
-
-
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query.from_user.id != ADMIN_USER_ID:
@@ -1275,10 +1202,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if action in HEADER_CHOICE_OPTIONS:
         await handle_header_choice_selection(query, context, action, payload)
-        return
-
-    if action in ("report_publish", "report_cancel"):
-        await handle_report_callback(query, context, action, payload)
         return
 
     draft = context.user_data.get("draft")
@@ -1360,8 +1283,10 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def run_report_pipeline(
     context: ContextTypes.DEFAULT_TYPE, period_label: str, start_date: str, end_date: str
 ) -> None:
-    """Общий пайплайн отчёта: БД -> агрегация -> Gemini -> черновик на
-    подтверждение. Используется и планировщиком, и ручными командами."""
+    """Общий пайплайн отчёта: БД -> агрегация -> Gemini -> публикация в канал
+    сразу, без подтверждения. Используется и планировщиком, и ручными
+    командами. Админ получает короткие уведомления по ходу (готовлю / готово
+    / ошибка), но ничего подтверждать не нужно."""
     sessions = get_sessions_in_range(start_date, end_date)
     stats = aggregate_report_stats(sessions, start_date, end_date)
     mistake_notes = collect_mistake_notes(sessions) or NO_MISTAKES_PLACEHOLDER
@@ -1377,7 +1302,20 @@ async def run_report_pipeline(
             "и попробуй ещё раз.",
         )
         return
-    await send_report_draft(context, period_label, report_text)
+
+    try:
+        await publish_report(context.bot, report_text)
+    except Exception:
+        logger.exception("Ошибка при публикации отчёта")
+        await context.bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text="Не удалось опубликовать отчёт. Проверь права бота в канале.",
+        )
+        return
+
+    await context.bot.send_message(
+        chat_id=ADMIN_USER_ID, text=f"Отчёт опубликован в канале ✅ ({period_label})"
+    )
 
 
 async def weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
