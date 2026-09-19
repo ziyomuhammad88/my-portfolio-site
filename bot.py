@@ -2,16 +2,19 @@
 Телеграм-бот для канала о трейдинге.
 
 Логика:
-1. Ты (админ) отправляешь боту в личку фото сделки с подписью-комментарием.
-2. Бот отправляет комментарий в Gemini, тот переписывает его в аккуратный
-   пост в стиле канала.
+1. Ты (админ) нажимаешь «▶️ Старт» — бот по шагам (опрос-анкета) спрашивает
+   скриншот сделки и детали по шаблону: инструмент, итог дня, количество
+   сделок, новости, контекст, а затем по каждой сделке отдельно — уровень
+   входа, причину входа, стоп, тейк, результат и ошибку/вывод.
+2. Когда опрос закончен, бот собирает ответы в заметку и отправляет её в
+   Gemini, тот оформляет её в аккуратный пост по тому же шаблону.
 3. Бот присылает тебе черновик поста (с фото) и кнопки "Опубликовать" / "Отмена".
 4. Если нужно что-то поправить — просто напиши следующим сообщением (или
    командой /edit <что поправить>), бот перегенерирует черновик и снова
    покажет его на подтверждение.
 5. Только после нажатия "Опубликовать" (или команды /post) пост уходит в
-   канал. Команда /stop отменяет и удаляет текущий черновик (аналог кнопки
-   "Отмена").
+   канал. Команда /stop отменяет и удаляет текущий опрос или черновик
+   (аналог кнопки "Отмена").
 
 Бот реагирует только на сообщения от ADMIN_USER_ID — это твоя защита от того,
 что кто-то посторонний напишет боту и что-то опубликует в канал.
@@ -285,13 +288,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update):
         return
     await update.message.reply_text(
-        "Привет! Пришли мне фото сделки с подписью-комментарием — я оформлю "
-        "пост и покажу тебе черновик перед публикацией в канал.\n\n"
+        "Привет! Нажми «▶️ Старт» — я по шагам спрошу детали сделки "
+        "(инструмент, итог дня, количество сделок, новости, контекст, а "
+        "затем по каждой сделке отдельно), попрошу скриншот и соберу "
+        "готовый пост.\n\n"
         "Команды:\n"
         "/edit <что поправить> — переделать текущий черновик (можно и просто "
         "написать текст правки следующим сообщением, без команды)\n"
         "/post — опубликовать текущий черновик в канал\n"
-        "/stop — отменить и удалить текущий черновик\n"
+        "/stop — отменить текущий опрос или черновик\n"
         "/restart — начать заново",
         reply_markup=menu_keyboard(),
     )
@@ -324,22 +329,199 @@ async def create_draft_from_source(
     return True
 
 
+# Шаги опроса-анкеты. Ключ — под ним ответ хранится в user_data["wizard"],
+# подсказка — вопрос, который увидит админ.
+HEADER_STEPS = [
+    ("instrument", "Какой инструмент? (например, EUR/USD)"),
+    ("day_result", "Итог дня? (например, -80$ или +150$)"),
+    ("trade_count", "Сколько сделок было за сессию? (число от 1 до 20)"),
+    ("news", 'Были важные новости? Если нет — напиши "нет".'),
+    (
+        "context",
+        'Контекст дня/рынка (тренд, диапазон, важные уровни)? '
+        'Если добавить нечего — напиши "нет".',
+    ),
+]
+
+TRADE_STEPS = [
+    ("direction", "Направление — лонг или шорт?"),
+    ("level", "От какого уровня вошёл?"),
+    ("why", "Почему вошёл? (сигнал / сетап)"),
+    ("stop", "Стоп — где?"),
+    ("take", "Тейк — где?"),
+    ("result", "Результат сделки? (плюс/минус, пункты или $)"),
+    ("mistake", "Что получилось / ошибка? Кратко."),
+]
+
+MAX_TRADE_COUNT = 20
+
+
+def parse_trade_count(text: str) -> int | None:
+    """Вернуть число сделок из ответа админа или None, если ввод невалиден."""
+    text = text.strip()
+    if not text.isdigit():
+        return None
+    value = int(text)
+    if not (1 <= value <= MAX_TRADE_COUNT):
+        return None
+    return value
+
+
+def parse_direction(text: str) -> str | None:
+    """Нормализовать направление сделки или None, если не распознано."""
+    normalized = text.strip().lower()
+    if normalized in ("лонг", "long", "л"):
+        return "Лонг"
+    if normalized in ("шорт", "short", "ш"):
+        return "Шорт"
+    return None
+
+
+def build_raw_comment(answers: dict, trades: list[dict]) -> str:
+    """Собрать ответы анкеты в текстовую заметку — вход для Gemini."""
+    lines = [
+        f"Инструмент: {answers['instrument']}",
+        f"Итог дня: {answers['day_result']}",
+        f"Количество сделок: {answers['trade_count']}",
+        f"Новости: {answers['news']}",
+        f"Контекст: {answers['context']}",
+    ]
+    for i, trade in enumerate(trades, start=1):
+        lines.append("")
+        lines.append(f"Сделка {i}:")
+        lines.append(f"Направление: {trade['direction']}")
+        lines.append(f"Уровень входа: {trade['level']}")
+        lines.append(f"Почему вошёл: {trade['why']}")
+        lines.append(f"Стоп: {trade['stop']}")
+        lines.append(f"Тейк: {trade['take']}")
+        lines.append(f"Результат: {trade['result']}")
+        lines.append(f"Что получилось / ошибка: {trade['mistake']}")
+    return "\n".join(lines)
+
+
+def start_wizard(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Завести пустое состояние опроса — первый шаг всегда просьба скриншота."""
+    context.user_data["wizard"] = {
+        "stage": "photo",  # "photo" -> "header" -> "trade"
+        "header_index": 0,
+        "trade_index": 0,
+        "trade_field_index": 0,
+        "photo_file_id": None,
+        "answers": {},
+        "trades": [],
+        "current_trade": {},
+    }
+
+
+async def ask_current_wizard_step(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показать вопрос для текущего шага активного опроса."""
+    wizard = context.user_data["wizard"]
+    if wizard["stage"] == "photo":
+        await message.reply_text("Пришли скриншот сделки (фото).")
+        return
+    if wizard["stage"] == "header":
+        _, prompt = HEADER_STEPS[wizard["header_index"]]
+        await message.reply_text(prompt)
+        return
+    total = wizard["answers"]["trade_count"]
+    _, prompt = TRADE_STEPS[wizard["trade_field_index"]]
+    await message.reply_text(f"Сделка {wizard['trade_index'] + 1}/{total}. {prompt}")
+
+
+async def begin_wizard(message, context: ContextTypes.DEFAULT_TYPE, intro_text: str) -> None:
+    """Сбросить текущий черновик/опрос и начать анкету заново."""
+    draft = context.user_data.pop("draft", None)
+    context.user_data.pop("wizard", None)
+    if draft:
+        await clear_draft_keyboard(context.bot, message.chat_id, draft)
+    await message.reply_text(intro_text, reply_markup=menu_keyboard())
+    start_wizard(context)
+    await ask_current_wizard_step(message, context)
+
+
+async def finish_wizard(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Опрос закончен — собрать заметку и передать в обычный пайплайн оформления."""
+    wizard = context.user_data.pop("wizard")
+    raw_comment = build_raw_comment(wizard["answers"], wizard["trades"])
+    await create_draft_from_source(message, context, raw_comment, wizard["photo_file_id"])
+
+
+async def handle_wizard_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработать фото, когда опрос ждёт именно его."""
+    wizard = context.user_data["wizard"]
+    wizard["photo_file_id"] = update.message.photo[-1].file_id
+    wizard["stage"] = "header"
+    await ask_current_wizard_step(update.message, context)
+
+
+async def handle_wizard_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработать текстовый ответ на текущий вопрос опроса."""
+    wizard = context.user_data["wizard"]
+    message = update.message
+    text = (message.text or "").strip()
+
+    if wizard["stage"] == "photo":
+        await message.reply_text("Сначала пришли скриншот сделки (фото), не текст.")
+        return
+
+    if wizard["stage"] == "header":
+        key, _ = HEADER_STEPS[wizard["header_index"]]
+        if key == "trade_count":
+            value = parse_trade_count(text)
+            if value is None:
+                await message.reply_text(
+                    f"Нужно целое число сделок от 1 до {MAX_TRADE_COUNT}, например 1 или 2."
+                )
+                return
+            wizard["answers"][key] = value
+        else:
+            wizard["answers"][key] = text
+
+        wizard["header_index"] += 1
+        if wizard["header_index"] >= len(HEADER_STEPS):
+            wizard["stage"] = "trade"
+            wizard["trade_index"] = 0
+            wizard["trade_field_index"] = 0
+            wizard["current_trade"] = {}
+        await ask_current_wizard_step(message, context)
+        return
+
+    # wizard["stage"] == "trade"
+    key, _ = TRADE_STEPS[wizard["trade_field_index"]]
+    if key == "direction":
+        direction = parse_direction(text)
+        if direction is None:
+            await message.reply_text('Напиши "лонг" или "шорт".')
+            return
+        wizard["current_trade"][key] = direction
+    else:
+        wizard["current_trade"][key] = text
+
+    wizard["trade_field_index"] += 1
+    if wizard["trade_field_index"] >= len(TRADE_STEPS):
+        wizard["trades"].append(wizard["current_trade"])
+        wizard["current_trade"] = {}
+        wizard["trade_index"] += 1
+        wizard["trade_field_index"] = 0
+        if wizard["trade_index"] >= wizard["answers"]["trade_count"]:
+            await finish_wizard(message, context)
+            return
+    await ask_current_wizard_step(message, context)
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update):
         return
 
-    caption = update.message.caption
-    photo_file_id = update.message.photo[-1].file_id
-    if not caption:
-        context.user_data["pending_photo_file_id"] = photo_file_id
-        await update.message.reply_text(
-            "Скриншот принят. Теперь пришли следующим сообщением заметку о сделке — "
-            "из неё я соберу пост. Так можно отправить более длинный текст, чем в подписи к фото."
-        )
+    wizard = context.user_data.get("wizard")
+    if wizard and wizard["stage"] == "photo":
+        await handle_wizard_photo(update, context)
         return
 
-    context.user_data.pop("pending_photo_file_id", None)
-    await create_draft_from_source(update.message, context, caption, photo_file_id)
+    await update.message.reply_text(
+        'Чтобы оформить пост, сначала нажми «▶️ Старт» — я сам попрошу '
+        "скриншот в нужный момент."
+    )
 
 
 async def apply_revision(
@@ -348,9 +530,7 @@ async def apply_revision(
     """Общая логика правки черновика — используется и обычным текстом, и /edit."""
     draft = context.user_data.get("draft")
     if not draft:
-        await message.reply_text(
-            "Сначала пришли фото сделки с подписью — тогда я подготовлю пост."
-        )
+        await message.reply_text('Сначала создай черновик — нажми «▶️ Старт».')
         return
 
     await message.reply_text("Вношу правку…")
@@ -379,30 +559,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     text = update.message.text
     if text == "▶️ Старт":
-        await restart_draft(update.message, context, "Пришли фото сделки с подписью или сначала фото, а затем заметку.")
+        await begin_wizard(update.message, context, "Начинаем оформление поста по шаблону.")
         return
     if text == "✏️ Править":
         if context.user_data.get("draft"):
             await update.message.reply_text("Напиши следующим сообщением, что изменить в черновике.")
         else:
-            await update.message.reply_text("Сначала создай черновик: пришли фото сделки и заметку.")
+            await update.message.reply_text('Сначала создай черновик — нажми «▶️ Старт».')
         return
     if text == "⏹ Отмена":
         await stop_draft(update.message, context)
         return
     if text == "🔄 Заново":
-        await restart_draft(update.message, context, "Черновик сброшен. Пришли новое фото сделки и заметку.")
+        await begin_wizard(update.message, context, "Черновик сброшен. Начинаем заново.")
         return
 
-    pending_photo_file_id = context.user_data.get("pending_photo_file_id")
-    if pending_photo_file_id and not context.user_data.get("draft"):
-        created = await create_draft_from_source(
-            update.message, context, update.message.text, pending_photo_file_id
-        )
-        if created:
-            context.user_data.pop("pending_photo_file_id", None)
+    if context.user_data.get("wizard"):
+        await handle_wizard_answer(update, context)
         return
-    await apply_revision(update.message, context, update.message.text)
+
+    if context.user_data.get("draft"):
+        await apply_revision(update.message, context, text)
+        return
+
+    await update.message.reply_text('Нажми «▶️ Старт», чтобы начать оформление поста.')
 
 
 async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -509,9 +689,7 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     draft = context.user_data.get("draft")
     if not draft:
-        await update.message.reply_text(
-            "Черновик не найден — сначала пришли фото сделки с подписью."
-        )
+        await update.message.reply_text('Черновик не найден — нажми «▶️ Старт», чтобы создать пост.')
         return
 
     try:
@@ -535,11 +713,11 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def stop_draft(message, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отменить черновик — вызывается и командой, и кнопкой меню."""
-    pending_photo = context.user_data.pop("pending_photo_file_id", None)
+    """Отменить опрос или черновик — вызывается и командой, и кнопкой меню."""
+    had_wizard = context.user_data.pop("wizard", None) is not None
     draft = context.user_data.pop("draft", None)
     if not draft:
-        text = "Ожидание заметки отменено." if pending_photo else "Нечего отменять — черновика нет."
+        text = "Опрос отменён." if had_wizard else "Нечего отменять."
         await message.reply_text(text, reply_markup=menu_keyboard())
         return
 
@@ -547,19 +725,10 @@ async def stop_draft(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_text("Отменено. Черновик удалён.", reply_markup=menu_keyboard())
 
 
-async def restart_draft(message, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    """Сбросить текущую работу и предложить создать новый пост."""
-    context.user_data.pop("pending_photo_file_id", None)
-    draft = context.user_data.pop("draft", None)
-    if draft:
-        await clear_draft_keyboard(context.bot, message.chat_id, draft)
-    await message.reply_text(text, reply_markup=menu_keyboard())
-
-
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update):
         return
-    await restart_draft(update.message, context, "Черновик сброшен. Пришли новое фото сделки и заметку.")
+    await begin_wizard(update.message, context, "Черновик сброшен. Начинаем заново.")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

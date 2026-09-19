@@ -7,6 +7,10 @@ from bot import (
     CHANNEL_ID,
     MAX_TELEGRAM_CAPTION_LENGTH,
     MAX_TELEGRAM_MESSAGE_LENGTH,
+    MAX_TRADE_COUNT,
+    build_raw_comment,
+    parse_direction,
+    parse_trade_count,
     publish_draft,
     safe_answer,
     split_telegram_text,
@@ -84,6 +88,103 @@ class PublishDraftTests(unittest.IsolatedAsyncioTestCase):
 
         bot_mock.send_photo.assert_awaited_once_with(chat_id=CHANNEL_ID, photo="file123")
         bot_mock.send_message.assert_awaited()
+
+
+class ParseTradeCountTests(unittest.TestCase):
+    def test_valid_number_is_parsed(self):
+        self.assertEqual(parse_trade_count("2"), 2)
+
+    def test_number_with_surrounding_whitespace_is_parsed(self):
+        self.assertEqual(parse_trade_count("  3 \n"), 3)
+
+    def test_non_numeric_text_is_rejected(self):
+        self.assertIsNone(parse_trade_count("две"))
+
+    def test_zero_is_rejected(self):
+        self.assertIsNone(parse_trade_count("0"))
+
+    def test_too_large_is_rejected(self):
+        self.assertIsNone(parse_trade_count(str(MAX_TRADE_COUNT + 1)))
+
+    def test_max_is_accepted(self):
+        self.assertEqual(parse_trade_count(str(MAX_TRADE_COUNT)), MAX_TRADE_COUNT)
+
+
+class ParseDirectionTests(unittest.TestCase):
+    def test_recognizes_long_variants(self):
+        for text in ["лонг", "Лонг", " ЛОНГ ", "long", "л"]:
+            self.assertEqual(parse_direction(text), "Лонг")
+
+    def test_recognizes_short_variants(self):
+        for text in ["шорт", "Шорт", "short", "ш"]:
+            self.assertEqual(parse_direction(text), "Шорт")
+
+    def test_unrecognized_text_returns_none(self):
+        self.assertIsNone(parse_direction("не знаю"))
+
+
+class BuildRawCommentTests(unittest.TestCase):
+    def test_header_fields_are_included(self):
+        answers = {
+            "instrument": "EUR/USD",
+            "day_result": "-80$",
+            "trade_count": 1,
+            "news": "нет",
+            "context": "нет",
+        }
+        trade = {
+            "direction": "Лонг",
+            "level": "1.0850",
+            "why": "отбой от диапазона",
+            "stop": "1.0835",
+            "take": "1.0880",
+            "result": "-15 пунктов",
+            "mistake": "рано вошёл",
+        }
+
+        comment = build_raw_comment(answers, [trade])
+
+        self.assertIn("Инструмент: EUR/USD", comment)
+        self.assertIn("Итог дня: -80$", comment)
+        self.assertIn("Количество сделок: 1", comment)
+        self.assertIn("Сделка 1:", comment)
+        self.assertIn("Направление: Лонг", comment)
+        self.assertIn("Что получилось / ошибка: рано вошёл", comment)
+
+    def test_multiple_trades_are_all_included_in_order(self):
+        answers = {
+            "instrument": "AUD/USD",
+            "day_result": "-100$",
+            "trade_count": 2,
+            "news": "нет",
+            "context": "нет",
+        }
+        trades = [
+            {
+                "direction": "Лонг",
+                "level": "0.6500",
+                "why": "сигнал 1",
+                "stop": "0.6490",
+                "take": "0.6520",
+                "result": "+10 пунктов",
+                "mistake": "без ошибок",
+            },
+            {
+                "direction": "Шорт",
+                "level": "0.6530",
+                "why": "сигнал 2",
+                "stop": "0.6540",
+                "take": "0.6500",
+                "result": "-5 пунктов",
+                "mistake": "рано закрыл",
+            },
+        ]
+
+        comment = build_raw_comment(answers, trades)
+
+        self.assertLess(comment.index("Сделка 1:"), comment.index("Сделка 2:"))
+        self.assertIn("Направление: Шорт", comment)
+        self.assertIn("Что получилось / ошибка: рано закрыл", comment)
 
 
 if __name__ == "__main__":
