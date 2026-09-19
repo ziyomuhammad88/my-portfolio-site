@@ -683,11 +683,12 @@ def choice_keyboard(options: list[str], callback_prefix: str) -> InlineKeyboardM
 
 
 def menu_keyboard() -> ReplyKeyboardMarkup:
-    """Постоянное меню для действий с черновиком в личном чате с ботом."""
+    """Постоянное меню для действий с черновиком и отчётами в личном чате с ботом."""
     return ReplyKeyboardMarkup(
         [
             ["▶️ Старт", "✏️ Править"],
             ["⏹ Отмена", "🔄 Заново"],
+            ["📊 Отчёт за неделю", "📅 Отчёт за месяц"],
         ],
         resize_keyboard=True,
     )
@@ -1073,6 +1074,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if text == "🔄 Заново":
         await begin_wizard(update.message, context, "Черновик сброшен. Начинаем заново.")
         return
+    if text == "📊 Отчёт за неделю":
+        await trigger_week_report(context)
+        return
+    if text == "📅 Отчёт за месяц":
+        await trigger_month_report(context)
+        return
 
     if context.user_data.get("wizard"):
         await handle_wizard_answer(update, context)
@@ -1318,36 +1325,44 @@ async def run_report_pipeline(
     )
 
 
-async def weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Плановый недельный отчёт — суббота 08:00 (REPORT_TIMEZONE)."""
+async def trigger_week_report(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Посчитать и опубликовать недельный отчёт (последние 7 дней) — общая
+    точка входа для планировщика, команды /weekreport и кнопки меню."""
     today = datetime.now(ZoneInfo(REPORT_TIMEZONE)).date()
     start_date, end_date = week_report_range(today)
     await run_report_pipeline(context, f"Неделя {start_date} — {end_date}", start_date, end_date)
 
 
-async def monthly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Плановый месячный отчёт — 1-е число, 08:00 (REPORT_TIMEZONE)."""
+async def trigger_month_report(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Посчитать и опубликовать месячный отчёт (прошлый календарный месяц) —
+    общая точка входа для планировщика, команды /monthreport и кнопки меню."""
     today = datetime.now(ZoneInfo(REPORT_TIMEZONE)).date()
     start_date, end_date = month_report_range(today)
     await run_report_pipeline(context, f"Месяц {start_date} — {end_date}", start_date, end_date)
+
+
+async def weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Плановый недельный отчёт — суббота 08:00 (REPORT_TIMEZONE)."""
+    await trigger_week_report(context)
+
+
+async def monthly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Плановый месячный отчёт — 1-е число, 08:00 (REPORT_TIMEZONE)."""
+    await trigger_month_report(context)
 
 
 async def weekreport_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Ручной запуск недельного отчёта (тот же диапазон, что и по расписанию)."""
     if not is_admin(update):
         return
-    today = datetime.now(ZoneInfo(REPORT_TIMEZONE)).date()
-    start_date, end_date = week_report_range(today)
-    await run_report_pipeline(context, f"Неделя {start_date} — {end_date}", start_date, end_date)
+    await trigger_week_report(context)
 
 
 async def monthreport_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Ручной запуск месячного отчёта (тот же диапазон, что и по расписанию)."""
     if not is_admin(update):
         return
-    today = datetime.now(ZoneInfo(REPORT_TIMEZONE)).date()
-    start_date, end_date = month_report_range(today)
-    await run_report_pipeline(context, f"Месяц {start_date} — {end_date}", start_date, end_date)
+    await trigger_month_report(context)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
