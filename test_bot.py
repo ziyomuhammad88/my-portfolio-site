@@ -4,13 +4,16 @@ from unittest.mock import AsyncMock, patch
 
 from telegram.error import BadRequest
 
+import bot
 from bot import (
     CHANNEL_ID,
+    GEMINI_TIMEOUT_SECONDS,
     MAX_TELEGRAM_CAPTION_LENGTH,
     MAX_TELEGRAM_MESSAGE_LENGTH,
     MAX_TRADE_COUNT,
     build_raw_comment,
     choice_keyboard,
+    get_completion,
     handle_header_choice_selection,
     parse_csv_list,
     parse_direction,
@@ -281,6 +284,34 @@ class HandleHeaderChoiceSelectionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("instrument", context.user_data["wizard"]["answers"])
         query.message.reply_text.assert_awaited_once()
+
+
+class GetCompletionTests(unittest.TestCase):
+    """Регрессия на баг: без таймаута зависший запрос к Gemini держал бота
+    на "Оформляю пост…" неопределённо долго вместо понятной ошибки."""
+
+    def _fake_response(self, content: str):
+        return types.SimpleNamespace(
+            choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=content))]
+        )
+
+    def test_passes_a_timeout_to_the_api_call(self):
+        with patch.object(
+            bot.gemini_client.chat.completions,
+            "create",
+            return_value=self._fake_response("  готовый пост  "),
+        ) as create_mock:
+            result = get_completion([{"role": "user", "content": "hi"}])
+
+        self.assertEqual(result, "готовый пост")
+        self.assertEqual(create_mock.call_args.kwargs["timeout"], GEMINI_TIMEOUT_SECONDS)
+
+    def test_empty_content_raises_value_error(self):
+        with patch.object(
+            bot.gemini_client.chat.completions, "create", return_value=self._fake_response("   ")
+        ):
+            with self.assertRaises(ValueError):
+                get_completion([{"role": "user", "content": "hi"}])
 
 
 if __name__ == "__main__":

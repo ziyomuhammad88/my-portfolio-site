@@ -178,12 +178,22 @@ def build_user_content(raw_comment: str, image_bytes: bytes | None = None):
     ]
 
 
+GEMINI_TIMEOUT_SECONDS = 45
+
+
 def get_completion(messages: list[dict]) -> str:
-    """Получить непустой текст от модели или явно сообщить об ошибке."""
+    """Получить непустой текст от модели или явно сообщить об ошибке.
+
+    Явный таймаут обязателен: без него при сетевых сбоях запрос может
+    зависнуть на неопределённое время (бот будет висеть на "Оформляю
+    пост…" сколько угодно), вместо того чтобы упасть с понятной ошибкой,
+    которую уже обрабатывает вызывающий код.
+    """
     response = gemini_client.chat.completions.create(
         model=GEMINI_MODEL,
         max_tokens=2048,
         messages=messages,
+        timeout=GEMINI_TIMEOUT_SECONDS,
     )
     content = response.choices[0].message.content
     if not content or not content.strip():
