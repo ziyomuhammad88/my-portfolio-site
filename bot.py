@@ -48,14 +48,22 @@ CHANNEL_ID = os.environ["CHANNEL_ID"]
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 
 
-def parse_instruments(raw: str) -> list[str]:
-    """Разобрать список инструментов из переменной окружения (через запятую)."""
+def parse_csv_list(raw: str) -> list[str]:
+    """Разобрать список значений из переменной окружения (через запятую)."""
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-# Если список задан — на шаге "Инструмент" бот покажет кнопки вместо
-# свободного текста.
-INSTRUMENTS = parse_instruments(os.environ.get("INSTRUMENTS", ""))
+# Если для шага анкеты задан список вариантов — бот покажет кнопки вместо
+# свободного текста (но можно всё равно ответить текстом, если нужного
+# варианта нет в списке — см. handle_wizard_answer).
+INSTRUMENTS = parse_csv_list(os.environ.get("INSTRUMENTS", ""))
+DAY_RESULTS = parse_csv_list(os.environ.get("DAY_RESULTS", ""))
+
+# Ключ шага анкеты -> список вариантов для кнопок (пусто/нет ключа = только текст).
+HEADER_CHOICE_OPTIONS = {
+    "instrument": INSTRUMENTS,
+    "day_result": DAY_RESULTS,
+}
 
 MAX_TELEGRAM_MESSAGE_LENGTH = 4096
 # У подписи к фото в Telegram лимит короче, чем у обычного текстового сообщения.
@@ -250,11 +258,11 @@ def draft_keyboard(draft_id: str) -> InlineKeyboardMarkup:
     )
 
 
-def instrument_keyboard(instruments: list[str]) -> InlineKeyboardMarkup:
-    """Кнопки выбора инструмента (по 2 в ряд), индекс — в callback_data."""
+def choice_keyboard(options: list[str], callback_prefix: str) -> InlineKeyboardMarkup:
+    """Кнопки выбора одного варианта из списка (по 2 в ряд), индекс — в callback_data."""
     buttons = [
-        InlineKeyboardButton(name, callback_data=f"instrument:{i}")
-        for i, name in enumerate(instruments)
+        InlineKeyboardButton(text, callback_data=f"{callback_prefix}:{i}")
+        for i, text in enumerate(options)
     ]
     rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
     return InlineKeyboardMarkup(rows)
@@ -451,8 +459,9 @@ async def ask_current_wizard_step(message, context: ContextTypes.DEFAULT_TYPE) -
         return
     if wizard["stage"] == "header":
         key, prompt = HEADER_STEPS[wizard["header_index"]]
-        if key == "instrument" and INSTRUMENTS:
-            await message.reply_text(prompt, reply_markup=instrument_keyboard(INSTRUMENTS))
+        options = HEADER_CHOICE_OPTIONS.get(key)
+        if options:
+            await message.reply_text(prompt, reply_markup=choice_keyboard(options, key))
             return
         await message.reply_text(prompt)
         return
@@ -678,27 +687,30 @@ async def safe_answer(query) -> None:
             raise
 
 
-async def handle_instrument_selection(query, context: ContextTypes.DEFAULT_TYPE, payload: str) -> None:
-    """Обработать нажатие кнопки с инструментом на шаге анкеты."""
+async def handle_header_choice_selection(
+    query, context: ContextTypes.DEFAULT_TYPE, key: str, payload: str
+) -> None:
+    """Обработать нажатие кнопки-варианта на шаге анкеты (инструмент, итог дня и т.п.)."""
     wizard = context.user_data.get("wizard")
     is_current_step = bool(
         wizard
         and wizard["stage"] == "header"
-        and HEADER_STEPS[wizard["header_index"]][0] == "instrument"
+        and HEADER_STEPS[wizard["header_index"]][0] == key
     )
     if not is_current_step:
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("Этот выбор уже не актуален.")
         return
 
+    options = HEADER_CHOICE_OPTIONS.get(key, [])
     try:
-        instrument = INSTRUMENTS[int(payload)]
+        value = options[int(payload)]
     except (ValueError, IndexError):
         await query.edit_message_reply_markup(reply_markup=None)
         return
 
     await query.edit_message_reply_markup(reply_markup=None)
-    wizard["answers"]["instrument"] = instrument
+    wizard["answers"][key] = value
     wizard["header_index"] += 1
     await ask_current_wizard_step(query.message, context)
 
@@ -716,8 +728,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_reply_markup(reply_markup=None)
         return
 
-    if action == "instrument":
-        await handle_instrument_selection(query, context, payload)
+    if action in HEADER_CHOICE_OPTIONS:
+        await handle_header_choice_selection(query, context, action, payload)
         return
 
     draft = context.user_data.get("draft")

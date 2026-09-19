@@ -10,10 +10,10 @@ from bot import (
     MAX_TELEGRAM_MESSAGE_LENGTH,
     MAX_TRADE_COUNT,
     build_raw_comment,
-    handle_instrument_selection,
-    instrument_keyboard,
+    choice_keyboard,
+    handle_header_choice_selection,
+    parse_csv_list,
     parse_direction,
-    parse_instruments,
     parse_trade_count,
     publish_draft,
     safe_answer,
@@ -194,20 +194,20 @@ class BuildRawCommentTests(unittest.TestCase):
         self.assertIn("Что получилось / ошибка: рано закрыл", comment)
 
 
-class ParseInstrumentsTests(unittest.TestCase):
+class ParseCsvListTests(unittest.TestCase):
     def test_splits_and_trims_comma_separated_list(self):
         self.assertEqual(
-            parse_instruments(" EURUSD, GBPUSD ,, XAUUSD "),
+            parse_csv_list(" EURUSD, GBPUSD ,, XAUUSD "),
             ["EURUSD", "GBPUSD", "XAUUSD"],
         )
 
     def test_empty_string_gives_empty_list(self):
-        self.assertEqual(parse_instruments(""), [])
+        self.assertEqual(parse_csv_list(""), [])
 
 
-class InstrumentKeyboardTests(unittest.TestCase):
+class ChoiceKeyboardTests(unittest.TestCase):
     def test_two_buttons_per_row_with_correct_callback_data(self):
-        markup = instrument_keyboard(["EURUSD", "GBPUSD", "XAUUSD"])
+        markup = choice_keyboard(["EURUSD", "GBPUSD", "XAUUSD"], "instrument")
         rows = markup.inline_keyboard
 
         self.assertEqual(len(rows), 2)
@@ -215,6 +215,12 @@ class InstrumentKeyboardTests(unittest.TestCase):
         self.assertEqual([b.callback_data for b in rows[0]], ["instrument:0", "instrument:1"])
         self.assertEqual([b.text for b in rows[1]], ["XAUUSD"])
         self.assertEqual(rows[1][0].callback_data, "instrument:2")
+
+    def test_callback_prefix_is_used_for_a_different_field(self):
+        markup = choice_keyboard(["-100$", "+100$"], "day_result")
+        rows = markup.inline_keyboard
+
+        self.assertEqual([b.callback_data for b in rows[0]], ["day_result:0", "day_result:1"])
 
 
 def make_wizard_context(**wizard_overrides) -> types.SimpleNamespace:
@@ -232,14 +238,14 @@ def make_wizard_context(**wizard_overrides) -> types.SimpleNamespace:
     return types.SimpleNamespace(user_data={"wizard": wizard})
 
 
-class HandleInstrumentSelectionTests(unittest.IsolatedAsyncioTestCase):
+class HandleHeaderChoiceSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_valid_selection_stores_answer_and_advances(self):
         context = make_wizard_context()
         query = AsyncMock()
         query.message = AsyncMock()
 
-        with patch("bot.INSTRUMENTS", ["EURUSD", "GBPUSD"]):
-            await handle_instrument_selection(query, context, "1")
+        with patch("bot.HEADER_CHOICE_OPTIONS", {"instrument": ["EURUSD", "GBPUSD"]}):
+            await handle_header_choice_selection(query, context, "instrument", "1")
 
         wizard = context.user_data["wizard"]
         self.assertEqual(wizard["answers"]["instrument"], "GBPUSD")
@@ -247,12 +253,22 @@ class HandleInstrumentSelectionTests(unittest.IsolatedAsyncioTestCase):
         query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
         query.message.reply_text.assert_awaited_once()
 
+    async def test_works_for_a_different_field_like_day_result(self):
+        context = make_wizard_context(header_index=1)  # шаг "day_result" в HEADER_STEPS
+        query = AsyncMock()
+        query.message = AsyncMock()
+
+        with patch("bot.HEADER_CHOICE_OPTIONS", {"day_result": ["-100$", "+100$"]}):
+            await handle_header_choice_selection(query, context, "day_result", "0")
+
+        self.assertEqual(context.user_data["wizard"]["answers"]["day_result"], "-100$")
+
     async def test_stale_selection_when_no_wizard(self):
         context = types.SimpleNamespace(user_data={})
         query = AsyncMock()
         query.message = AsyncMock()
 
-        await handle_instrument_selection(query, context, "0")
+        await handle_header_choice_selection(query, context, "instrument", "0")
 
         query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
         query.message.reply_text.assert_awaited_once()
@@ -263,8 +279,8 @@ class HandleInstrumentSelectionTests(unittest.IsolatedAsyncioTestCase):
         query = AsyncMock()
         query.message = AsyncMock()
 
-        with patch("bot.INSTRUMENTS", ["EURUSD", "GBPUSD"]):
-            await handle_instrument_selection(query, context, "0")
+        with patch("bot.HEADER_CHOICE_OPTIONS", {"instrument": ["EURUSD", "GBPUSD"]}):
+            await handle_header_choice_selection(query, context, "instrument", "0")
 
         self.assertNotIn("instrument", context.user_data["wizard"]["answers"])
         query.message.reply_text.assert_awaited_once()
