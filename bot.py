@@ -59,10 +59,16 @@ def parse_csv_list(raw: str) -> list[str]:
 INSTRUMENTS = parse_csv_list(os.environ.get("INSTRUMENTS", ""))
 DAY_RESULTS = parse_csv_list(os.environ.get("DAY_RESULTS", ""))
 
+NEWS_OPTIONS = ["Нет", "Да"]
+# Если на шаге "Новости" выбрали "Да" — не сохраняем это как ответ, а
+# просим кратко уточнить, что за новость (см. handle_header_choice_selection).
+NEWS_FOLLOWUP_PROMPT = "Какие новости? Кратко."
+
 # Ключ шага анкеты -> список вариантов для кнопок (пусто/нет ключа = только текст).
 HEADER_CHOICE_OPTIONS = {
     "instrument": INSTRUMENTS,
     "day_result": DAY_RESULTS,
+    "news": NEWS_OPTIONS,
 }
 
 MAX_TELEGRAM_MESSAGE_LENGTH = 4096
@@ -723,6 +729,13 @@ async def handle_header_choice_selection(
         return
 
     await query.edit_message_reply_markup(reply_markup=None)
+
+    if key == "news" and value == "Да":
+        # Не сохраняем "Да" как ответ — остаёмся на этом же шаге и ждём
+        # текстом, что за новость (handle_wizard_answer обработает как обычно).
+        await query.message.reply_text(NEWS_FOLLOWUP_PROMPT)
+        return
+
     wizard["answers"][key] = value
     wizard["header_index"] += 1
     await ask_current_wizard_step(query.message, context)

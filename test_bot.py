@@ -263,6 +263,31 @@ class HandleHeaderChoiceSelectionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(context.user_data["wizard"]["answers"]["day_result"], "-100$")
 
+    async def test_news_no_stores_answer_and_advances(self):
+        context = make_wizard_context(header_index=3)  # шаг "news" в HEADER_STEPS
+        query = AsyncMock()
+        query.message = AsyncMock()
+
+        with patch("bot.HEADER_CHOICE_OPTIONS", {"news": bot.NEWS_OPTIONS}):
+            await handle_header_choice_selection(query, context, "news", "0")  # "Нет"
+
+        wizard = context.user_data["wizard"]
+        self.assertEqual(wizard["answers"]["news"], "Нет")
+        self.assertEqual(wizard["header_index"], 4)
+
+    async def test_news_yes_asks_followup_instead_of_advancing(self):
+        context = make_wizard_context(header_index=3)  # шаг "news" в HEADER_STEPS
+        query = AsyncMock()
+        query.message = AsyncMock()
+
+        with patch("bot.HEADER_CHOICE_OPTIONS", {"news": bot.NEWS_OPTIONS}):
+            await handle_header_choice_selection(query, context, "news", "1")  # "Да"
+
+        wizard = context.user_data["wizard"]
+        self.assertNotIn("news", wizard["answers"])
+        self.assertEqual(wizard["header_index"], 3)  # шаг не сдвинулся
+        query.message.reply_text.assert_awaited_once_with(bot.NEWS_FOLLOWUP_PROMPT)
+
     async def test_stale_selection_when_no_wizard(self):
         context = types.SimpleNamespace(user_data={})
         query = AsyncMock()
